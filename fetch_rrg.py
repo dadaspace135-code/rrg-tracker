@@ -22,6 +22,8 @@ import yfinance as yf
 BENCH = "SPY"      # ベンチマーク(S&P500)
 LOOKBACK = 60      # 長期ルックバック(営業日)
 POINTS = 21        # 最新 + 過去20日
+RRG_ROWS = 168     # RRG計算に使う直近営業日数(約8か月)
+SPARK_POINTS = 52  # 1年スパークラインの点数(週次相当)
 WITH_CAP = os.getenv("WITH_CAP", "true").strip().lower() == "true"   # 時価総額(バブルサイズ用)も取得。環境変数 WITH_CAP=false で無効化(高速)。
 
 # テーマ = 等加重の個別株バスケット。ティッカーは 2026 年時点（例: Block=XYZ, Fiserv=FISV）。
@@ -60,6 +62,23 @@ THEME_DEFS = [
 ]
 
 
+def sparkline(series):
+    """直近1年を SPARK_POINTS 個に間引き、開始日=0% とした変化率(%)の配列にする。
+    戻り値: (配列, 1年騰落率) / データ不足なら (None, None)"""
+    s = np.asarray(series, dtype=float)
+    s = s[np.isfinite(s)]
+    if len(s) < 20:
+        return None, None
+    s = s[-252:]                                   # 直近1年ぶん
+    n = min(SPARK_POINTS, len(s))
+    idx = np.unique(np.linspace(0, len(s) - 1, n).round().astype(int))
+    base = float(s[idx[0]])
+    if base == 0 or not np.isfinite(base):
+        return None, None
+    vals = [round((float(s[i]) / base - 1.0) * 100, 1) for i in idx]
+    return vals, vals[-1]
+
+
 def fetch_caps(tickers):
     """各ティッカーの時価総額(USD)を取得。取れないものは None。yfinance の
     fast_info を使用（銘柄数が多いと時間がかかり、たまに欠損します）。"""
@@ -88,9 +107,12 @@ def fetch_caps(tickers):
 
 def main():
     uniq = sorted({t for d in THEME_DEFS for t in d["tickers"]} | {BENCH})
-    raw = yf.download(uniq, period="8mo", auto_adjust=True, progress=False)
-    close = (raw["Close"] if "Close" in raw else raw).sort_index().ffill()
-    close = close[close[BENCH].notna()]
+    raw = yf.download(uniq, period="14mo", auto_adjust=True, progress=False)
+    full = (raw["Close"] if "Close" in raw else raw).sort_index().ffill()
+    full = full[full[BENCH].notna()]
+    # RRG の計算は従来どおり直近8か月ぶんで行う（過去の出力と連続性を保つため）。
+    # スパークラインだけ full（14か月）を使う。
+    close = full.tail(RRG_ROWS)
 
     if BENCH not in close.columns:
         raise SystemExit("SPY の取得に失敗しました。ネットワークを確認してください。")
@@ -135,7 +157,12 @@ def main():
                     if j < 0 or not np.isfinite(s[j]) or s[j] == 0:
                         return None
                     return round(float(s[-1] / s[j] - 1) * 100, 1)
-                stocks.append({"t": tk, "d1": ret(1), "d5": ret(5), "d63": ret(63)})
+                st = {"t": tk, "d1": ret(1), "d5": ret(5), "d63": ret(63)}
+                sp, y1 = sparkline(full[tk].to_numpy())
+                if sp:
+                    st["spark"] = sp
+                    st["d252"] = y1
+                stocks.append(st)
             out.append({"name": d["name"], "color": d["color"], "history": hist, "tickers": used, "stocks": stocks})
 
     if WITH_CAP and out:
