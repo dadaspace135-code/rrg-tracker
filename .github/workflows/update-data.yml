@@ -1,0 +1,61 @@
+name: Update RRG data
+
+# 平日の米国引け後に fetch_rrg.py を実行し、data.json を自動コミットします。
+# timezone を指定しているので、夏時間・冬時間の切替でもズレません。
+# 手動実行(workflow_dispatch)も可能です。
+
+on:
+  schedule:
+    # 米東部時間の平日 17:30（16:00の引け後）
+    - cron: "30 17 * * 1-5"
+      timezone: "America/New_York"
+  workflow_dispatch:
+    inputs:
+      with_cap:
+        description: "時価総額も取得する (true/false)"
+        required: false
+        default: "false"
+
+# data.json をリポジトリに push するための書き込み権限
+permissions:
+  contents: write
+
+# 実行が重ならないように直列化
+concurrency:
+  group: update-rrg-data
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch data
+        env:
+          # 毎日の自動実行は高速・堅牢のため時価総額なし(false)。
+          # 手動実行時は上の with_cap 入力で true にできます。
+          WITH_CAP: ${{ github.event.inputs.with_cap || 'false' }}
+        run: python fetch_rrg.py
+
+      - name: Commit updated data.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data.json
+          if git diff --cached --quiet; then
+            echo "No changes to data.json — skipping commit."
+          else
+            git commit -m "chore: update RRG data ($(date -u +%Y-%m-%d))"
+            git push
+          fi
