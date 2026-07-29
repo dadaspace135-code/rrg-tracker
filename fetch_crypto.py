@@ -90,7 +90,10 @@ AUTO_SKIP_WORDS = [
     "stablecoin", "wrapped", "tokenized", "asset-backed", "staking derivative",
     # 投資家・ファンド・上場ラベル(テーマではない)
     "portfolio", "index", "capital", "ventures", "backed", "launchpad", "launchpool",
-    "ico", "ido", "presale", "airdrop",
+    "ico", "ido", "presale", "airdrop", "alpha", "spotlight", "listing",
+    "binance", "coinbase", "upbit", "bithumb", "okx", "bybit", "kucoin", "gate",
+    # ミーム等の下位ラベル(上位テーマと重複するだけ)
+    "themed", "-themed", "inspired", "fan token",
     # 出自・法的ラベル
     "made in", "alleged", "securities", "usa", "china", "korea", "japan",
     "elon", "celebrity", "meme-ish",
@@ -104,7 +107,8 @@ AUTO_SKIP_WORDS = [
 
 
 # 単体だと汎用的すぎるが、複合語なら有効なもの(例: Bridge Governance は残す)
-AUTO_SKIP_EXACT = {"governance", "protocol", "token", "coin", "native", "base"}
+AUTO_SKIP_EXACT = {"governance", "protocol", "token", "coin", "native", "base",
+                   "infrastructure", "utility", "platform", "technology", "finance"}
 
 
 def blocked(name):
@@ -218,14 +222,25 @@ def members(cat_id, universe):
     return picks
 
 
+def norm_name(n):
+    """比較用にカテゴリ名を正規化(括弧内と記号を落とす)。"""
+    n = re.sub(r"\(.*?\)", " ", n.lower())
+    n = re.sub(r"[^a-z0-9 ]", " ", n)
+    return " ".join(n.split())
+
+
 def resolve(defs, universe, want=None, dedup=False, max_fetch=40):
     """カテゴリ定義 -> 構成銘柄。dedup=True なら既出テーマと重なるカテゴリを捨てる。"""
-    out, seen, fetched = [], [], 0
+    out, seen, names, fetched = [], [], [], 0
     for jp, cid, en in defs:
         if want is not None and len(out) >= want:
             break
         if fetched >= max_fetch:
             break
+        nm = norm_name(jp)
+        if dedup and any(nm and (nm in o or o in nm) for o in names):
+            print(f"  [skip] {jp}: 名前が既出テーマと重複")
+            continue
         picks = members(cid, universe)
         fetched += 1
         if len(picks) < MIN_MEMBERS:
@@ -236,6 +251,7 @@ def resolve(defs, universe, want=None, dedup=False, max_fetch=40):
             print(f"  [skip] {jp}: 既出テーマと構成銘柄が重複")
             continue
         seen.append(ids)
+        names.append(nm)
         out.append((jp, en, picks))
     return out
 
