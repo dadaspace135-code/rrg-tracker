@@ -24,6 +24,7 @@
 
 import json
 import os
+import re
 import time
 import numpy as np
 import requests
@@ -38,7 +39,9 @@ ROWS = 180                 # RRG計算に使う直近日数
 SPARK_POINTS = 52
 TOP_N = int(os.getenv("TOP_N", "500"))
 PER_THEME = 8              # 1テーマあたりの最大銘柄数
-AUTO_THEMES = 18           # 自動分類で採用するカテゴリ数
+AUTO_THEMES = 16           # 自動分類で採用するカテゴリ数
+MIN_MEMBERS = 3            # これ未満の銘柄しか無いテーマは捨てる
+OVERLAP_MAX = 0.6          # 既出テーマと構成銘柄がこれ以上重なったら捨てる
 
 CG = "https://api.coingecko.com/api/v3"
 KEY = os.getenv("COINGECKO_API_KEY", "").strip()
@@ -79,8 +82,44 @@ MANUAL_DEFS = [
 ]
 
 # 自動分類から外すカテゴリ(広すぎる/値動きが無い)
-AUTO_SKIP_WORDS = ["ecosystem", "stablecoin", "portfolio", "index", "wrapped",
-                   "tokenized", "asset-backed", "all categories", "cryptocurrency"]
+AUTO_SKIP_WORDS = [
+    # 広すぎる / 他テーマと丸かぶり
+    "ecosystem", "smart contract platform", "cryptocurrency", "all categories",
+    "layer 0",
+    # 値動きが無い / 原資産の複製
+    "stablecoin", "wrapped", "tokenized", "asset-backed", "staking derivative",
+    # 投資家・ファンド・上場ラベル(テーマではない)
+    "portfolio", "index", "capital", "ventures", "backed", "launchpad", "launchpool",
+    "ico", "ido", "presale", "airdrop",
+    # 出自・法的ラベル
+    "made in", "alleged", "securities", "usa", "china", "korea", "japan",
+    "elon", "celebrity", "meme-ish",
+    # コンセンサス方式(テーマではない)
+    "proof of", "pos", "pow",
+    # 特定チェーン固有
+    "native", "ethereum", "solana", "avalanche", "polygon", "arbitrum", "optimism",
+    "base", "sui", "aptos", "ton", "tron", "cardano", "polkadot", "cosmos", "near",
+    "algorand", "fantom", "sonic", "berachain", "hyperliquid", "bnb",
+]
+
+
+# 単体だと汎用的すぎるが、複合語なら有効なもの(例: Bridge Governance は残す)
+AUTO_SKIP_EXACT = {"governance", "protocol", "token", "coin", "native", "base"}
+
+
+def blocked(name):
+    """除外語判定。名前そのものが汎用語なら除外、複数語はそのまま部分一致、
+    1語は語境界(複数形も含む)で判定する。"""
+    n = name.lower().strip()
+    if n in AUTO_SKIP_EXACT:
+        return True
+    for w in AUTO_SKIP_WORDS:
+        if " " in w or "-" in w:
+            if w in n:
+                return True
+        elif re.search(r"\b" + re.escape(w) + r"s?\b", n):   # 複数形も拾う
+            return True
+    return False
 
 
 def cg_get(path, params=None, tries=4):
@@ -160,15 +199,7 @@ def pick_manual(cats):
 def pick_auto(cats):
     """時価総額の大きいカテゴリを機械的に採用。"""
     ranked = sorted(cats, key=lambda c: -(c.get("market_cap") or 0))
-    out = []
-    for c in ranked:
-        nm = c["name"].lower()
-        if any(w in nm for w in AUTO_SKIP_WORDS):
-            continue
-        out.append((c["name"], c["id"], c["name"]))
-        if len(out) >= AUTO_THEMES:
-            break
-    return out
+    return [(c["name"], c["id"], c["name"]) for c in ranked if not blocked(c["name"])]
 
 
 def members(cat_id, universe):
@@ -187,6 +218,28 @@ def members(cat_id, universe):
     return picks
 
 
+def resolve(defs, universe, want=None, dedup=False, max_fetch=40):
+    """カテゴリ定義 -> 構成銘柄。dedup=True なら既出テーマと重なるカテゴリを捨てる。"""
+    out, seen, fetched = [], [], 0
+    for jp, cid, en in defs:
+        if want is not None and len(out) >= want:
+            break
+        if fetched >= max_fetch:
+            break
+        picks = members(cid, universe)
+        fetched += 1
+        if len(picks) < MIN_MEMBERS:
+            print(f"  [skip] {jp}: 構成銘柄 {len(picks)} 件のみ")
+            continue
+        ids = {u["id"] for u in picks}
+        if dedup and any(len(ids & s) / len(ids) > OVERLAP_MAX for s in seen):
+            print(f"  [skip] {jp}: 既出テーマと構成銘柄が重複")
+            continue
+        seen.append(ids)
+        out.append((jp, en, picks))
+    return out
+
+
 def sparkline(series):
     s = np.asarray(series, dtype=float)
     s = s[np.isfinite(s)]
@@ -202,15 +255,14 @@ def sparkline(series):
     return vals, vals[-1]
 
 
-def build(themedefs, universe, close, full, bench):
-    """テーマ定義 -> RRG用の history / stocks を組み立てる。"""
+def build(resolved, close, full, bench):
+    """解決済みテーマ -> RRG用の history / stocks を組み立てる。"""
     N = len(bench)
     lb = min(LOOKBACK, N - 2)
     win = max(2, min(POINTS, N - lb))
     start = N - win
     out = []
-    for i, (jp, cat_id, en) in enumerate(themedefs):
-        picks = members(cat_id, universe)
+    for i, (jp, en, picks) in enumerate(resolved):
         comps, used = [], []
         for u in picks:
             tk = yahoo_ticker(u["sym"])
@@ -221,8 +273,8 @@ def build(themedefs, universe, close, full, bench):
                 continue
             comps.append(s)
             used.append(u)
-        if len(comps) < 2:
-            print(f"  [skip] {jp}: 有効銘柄 {len(comps)} 件")
+        if len(comps) < MIN_MEMBERS:
+            print(f"  [skip] {jp}: 価格を取得できた銘柄 {len(comps)} 件のみ")
             continue
         idx = np.zeros(N)
         for s in comps:
@@ -301,16 +353,22 @@ def main():
     if len(bench) < LOOKBACK + 5:
         raise SystemExit("日数が不足しています")
 
-    print("手動テーマを構築中…")
-    manual = build(manual_defs, universe, close, full, bench)
+    print("厳選テーマの構成銘柄を解決中…")
+    manual_res = resolve(manual_defs, universe)
+    print("自動テーマの構成銘柄を解決中…(重複カテゴリは除外)")
+    auto_res = resolve(auto_defs, universe, want=AUTO_THEMES, dedup=True)
+
+    print("厳選テーマを構築中…")
+    manual = build(manual_res, close, full, bench)
     print("自動テーマを構築中…")
-    auto = build(auto_defs, universe, close, full, bench)
+    auto = build(auto_res, close, full, bench)
 
     payload = {
         "lastDate": str(close.index[-1].date()),
         "benchmark": BENCH_SYM,
         "shortDays": SHORT,
         "metricLabels": {"d252": "1年", "d63": "30日", "d5": "7日", "d1": "1日"},
+        "title": "暗号資産テーマトラッカー",
         "setLabels": {"manual": "厳選テーマ", "auto": "自動分類"},
         "sets": {"manual": manual, "auto": auto},
     }
